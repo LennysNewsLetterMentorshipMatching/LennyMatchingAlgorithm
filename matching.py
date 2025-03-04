@@ -45,7 +45,7 @@ def get_sentiment_score(text):
 mentors_filtered['Sentiment'] = mentors_filtered['Open Answer'].apply(get_sentiment_score)
 mentees_filtered['Sentiment'] = mentees_filtered['Open Answer'].apply(get_sentiment_score)
 
-# Define a function to calculate matching score, including preference for 'Previous Matches'
+# Define a function to calculate matching score, including preference for 'Previous Matches' and important attributes
 def calculate_score_with_preference(mentor, mentee):
     score = 1000
     yoe_diff = mentor['Avg Year of YOE'] - mentee['Avg Year of YOE']
@@ -64,21 +64,30 @@ def calculate_score_with_preference(mentor, mentee):
         'Shared Identity': 5
     }
 
-    # Calculate score based on important attributes
-    for attr in ["Important Attribute - First", "Important Attribute - Second", "Important Attribute - Third"]:
-        weight = attribute_weights.get(mentor[attr].strip(), 0)
-        if weight > 0 and mentor[attr].strip() == mentee[attr].strip():
-            score += weight
-
     # Calculate score based on years of experience
     if yoe_diff > 8:
-        score += 50
+        score += 250
     elif 4 <= yoe_diff <= 8:
-        score += 100
+        score += 500
     elif 2 <= yoe_diff <= 3:
-        score += 160
+        score += 800
     elif yoe_diff <= 0:
         score -= 1000
+
+    # Calculate score based on important attributes
+    attribute_columns = ["Important Attribute - First", "Important Attribute - Second", "Important Attribute - Third"]
+    for i, attr in enumerate(attribute_columns):
+        mentor_attr = mentor[attr].strip()
+        mentee_attr = mentee[attr].strip()
+        
+        # Check for exact match in the same column
+        if mentor_attr == mentee_attr:
+            score += attribute_weights.get(mentor_attr, 0) * 3  # Triple weight for exact column match
+        else:
+            # Check for matches in different columns
+            for j, other_attr in enumerate(attribute_columns):
+                if i != j and mentor_attr == mentee[other_attr].strip():
+                    score += attribute_weights.get(mentor_attr, 0) * 1.5  # 1.5x weight for match in different column
 
     # Penalty for offset difference
     score -= offset_diff * 10
@@ -113,12 +122,13 @@ prob += lpSum(pair_vars[mentor_index, mentee_index] * calculate_score_with_prefe
               mentors_filtered.iloc[mentor_index], mentees_filtered.iloc[mentee_index]) 
               for mentor_index, mentee_index in mentor_mentee_pairs)
 
-# Add constraints: each mentee can only have one mentor, and each mentor can have up to two mentees.
+# Add constraints
 for mentee_index in range(len(mentees_filtered)):
     prob += lpSum(pair_vars[mentor_index, mentee_index] for mentor_index in range(len(mentors_filtered))) <= 1
 
 for mentor_index in range(len(mentors_filtered)):
     prob += lpSum(pair_vars[mentor_index, mentee_index] for mentee_index in range(len(mentees_filtered))) <= 2
+    prob += lpSum(pair_vars[mentor_index, mentee_index] for mentee_index in range(len(mentees_filtered))) >= 1
 
 for mentor_index, mentee_index in mentor_mentee_pairs:
     mentor_email = mentors_filtered.iloc[mentor_index]['Email']
