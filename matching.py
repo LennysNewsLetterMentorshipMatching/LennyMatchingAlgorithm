@@ -18,7 +18,8 @@ previous_matches = pd.read_csv('matched_pairs2025_pulp.csv', sep='\t')
 mentors_filtered = mentors.filter(items=["Email", "Offset", "Avg Year of YOE", "Important Attribute - First", 
                                          "Important Attribute - Second", "Important Attribute - Third", "Topics", "Open Answer"])
 mentees_filtered = mentees.filter(items=["Email", "Offset", "Avg Year of YOE", "Important Attribute - First", 
-                                         "Important Attribute - Second", "Important Attribute - Third", "Topics", "Open Answer"])
+                                         "Important Attribute - Second", "Important Attribute - Third", "Topics", 
+                                         "Open Answer", "Previous Matches"])
 
 # Function to process comma-separated topics into a list
 def clean_multiselect(x):
@@ -44,8 +45,8 @@ def get_sentiment_score(text):
 mentors_filtered['Sentiment'] = mentors_filtered['Open Answer'].apply(get_sentiment_score)
 mentees_filtered['Sentiment'] = mentees_filtered['Open Answer'].apply(get_sentiment_score)
 
-# Define a function to calculate matching score
-def calculate_score(mentor, mentee):
+# Define a function to calculate matching score, including preference for 'Previous Matches'
+def calculate_score_with_preference(mentor, mentee):
     score = 1000
     yoe_diff = mentor['Avg Year of YOE'] - mentee['Avg Year of YOE']
     offset_diff = abs(mentor['Offset'] - mentee['Offset'])
@@ -89,6 +90,14 @@ def calculate_score(mentor, mentee):
     # Add score based on sentiment similarity
     score += (1 - sentiment_diff) * 50
 
+    # Add preference for mentees based on 'Previous Matches'
+    if mentee['Previous Matches'] == 'No':
+        score += 10
+    elif mentee['Previous Matches'] == 'Yes - as a mentor':
+        score += 5
+    elif mentee['Previous Matches'] == 'Yes - as a mentee':
+        score += 0
+
     return score
 
 # Create LP problem instance
@@ -99,17 +108,17 @@ mentor_mentee_pairs = [(mentor_index, mentee_index) for mentor_index in range(le
                        for mentee_index in range(len(mentees_filtered))]
 pair_vars = LpVariable.dicts("Pair", mentor_mentee_pairs, cat='Binary')
 
-# Define the objective function
-prob += lpSum(pair_vars[mentor_index, mentee_index] * calculate_score(mentors_filtered.iloc[mentor_index], mentees_filtered.iloc[mentee_index]) 
+# Define the objective function with the updated scoring function
+prob += lpSum(pair_vars[mentor_index, mentee_index] * calculate_score_with_preference(
+              mentors_filtered.iloc[mentor_index], mentees_filtered.iloc[mentee_index]) 
               for mentor_index, mentee_index in mentor_mentee_pairs)
 
-# Add constraints
+# Add constraints: each mentee can only have one mentor, and each mentor can have up to two mentees.
 for mentee_index in range(len(mentees_filtered)):
     prob += lpSum(pair_vars[mentor_index, mentee_index] for mentor_index in range(len(mentors_filtered))) <= 1
 
 for mentor_index in range(len(mentors_filtered)):
     prob += lpSum(pair_vars[mentor_index, mentee_index] for mentee_index in range(len(mentees_filtered))) <= 2
-    prob += lpSum(pair_vars[mentor_index, mentee_index] for mentee_index in range(len(mentees_filtered))) >= 1
 
 for mentor_index, mentee_index in mentor_mentee_pairs:
     mentor_email = mentors_filtered.iloc[mentor_index]['Email']
