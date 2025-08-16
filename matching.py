@@ -1,5 +1,5 @@
 """
-MENTOR-MENTEE MATCHING ALGORITHM WITH UTC TIME OVERLAP & DUPLICATE PREVENTION
+MENTOR-MENTEE MATCHING ALGORITHM
 ============================================================================
 
 This script optimally matches mentors with mentees using Mixed Integer Linear Programming (MILP).
