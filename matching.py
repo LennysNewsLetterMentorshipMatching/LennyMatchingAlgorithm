@@ -1,7 +1,6 @@
 """
 MENTOR-MENTEE MATCHING ALGORITHM
-============================================================================
-
+====
 This script optimally matches mentors with mentees using Mixed Integer Linear Programming (MILP).
 It maximizes total matching quality while respecting business constraints and prevents duplicate 
 submission IDs in the output.
@@ -40,9 +39,10 @@ from collections import defaultdict
 from nltk.sentiment import SentimentIntensityAnalyzer
 from ortools.linear_solver import pywraplp
 
-# =========================
+# =
 # CONFIGURATION & FILE HANDLING
-# =========================
+# =
+
 # Update these paths to match your CSV file locations
 MENTORS_CSV = 'Mentor-Original-Submissions.csv'
 MENTEES_CSV = 'Mentee-Original-Submissions.csv'
@@ -56,23 +56,60 @@ for filepath in [MENTORS_CSV, MENTEES_CSV]:
             f"Check your paths or working directory: {os.getcwd()}"
         )
 
-# =========================
+# =
 # DATA LOADING & VALIDATION
-# =========================
+# =
+
 print("Loading mentor and mentee data...")
 mentors = pd.read_csv(MENTORS_CSV)
 mentees = pd.read_csv(MENTEES_CSV)
 
-# Validate that all required columns exist in both datasets
-# Note: Submission ID columns have different names in each CSV
-# This prevents runtime errors and gives clear feedback about missing data
+# Timezone offset mapping - common timezone abbreviations to UTC offset
+TIMEZONE_OFFSETS = {
+    'PST - Pacific US/Canada': -8,
+    'EST - Eastern US/Canada': -5,
+    'CST - Central US/Canada': -6,
+    'MST - Mountain US/Canada': -7,
+    'GMT - Greenwich Mean Time': 0,
+    'CET - Central Europe': 1,
+    'EET - Eastern Europe': 2,
+    'IST - India': 5.5,
+    'JST - Japan': 9,
+    'AEST - Eastern Australia': 10,
+    'SGT - Singapore': 8,
+    'WET - Western Europe': 0,
+    'BRT - Brazil (Brasília)': -3,
+    'CST - China': 8,
+    'ICT - Thailand': 7,
+    'TPE - Taipei': 8,
+    'MSK - Moscow, Russia': 3,
+    'AST - Atlantic Canada': -4
+}
 
-# Common columns required in both datasets
+def parse_timezone_to_offset(timezone_str):
+    """Convert timezone string to numeric offset"""
+    if pd.isna(timezone_str):
+        return np.nan
+    
+    # Clean the string
+    timezone_str = str(timezone_str).strip()
+    
+    # Direct mapping
+    if timezone_str in TIMEZONE_OFFSETS:
+        return TIMEZONE_OFFSETS[timezone_str]
+    
+    # If it's already a number, use it
+    try:
+        return float(timezone_str)
+    except:
+        # Default to 0 if we can't parse
+        return 0
+
+# Common columns required in both datasets - UPDATED TO MATCH ACTUAL COLUMN NAMES
 common_required_columns = [
-    "Full Name",                    # Person's name for output identification
-    "Coda Email",                   # Contact information
-    "Offset",                       # Time zone offset (e.g., -5 for EST, +1 for CET)
-    "Avg Year of YOE",              # Years of experience (mentor must > mentee)
+    "Coda Email",                   # Contact information (this exists in both)
+    "Timezones",                    # Time zone field (will convert to offset)
+    "Years of Experience",          # Years of experience (mentor must > mentee)
     "Roles",                        # Job roles (comma-separated, e.g., "PM,Designer")
     "Topics",                       # Topics of interest (comma-separated)
     "Industry",                     # Industries (comma-separated)
@@ -85,7 +122,7 @@ common_required_columns = [
     "Important Attribute - Third"   # Third most important matching criteria
 ]
 
-# Dataset-specific columns (different names for submission IDs)
+# Dataset-specific columns (different names for submission IDs) - UPDATED
 mentor_specific_columns = ["Mentor Submission ID"]    # Column name in mentor CSV
 mentee_specific_columns = ["Mentee Submission ID"]    # Column name in mentee CSV
 
@@ -101,16 +138,17 @@ missing_mentee_specific = [col for col in mentee_specific_columns if col not in 
 if missing_mentor_common or missing_mentor_specific:
     all_missing_mentor = missing_mentor_common + missing_mentor_specific
     raise ValueError(f"Mentors CSV missing required columns: {all_missing_mentor}")
-
+    
 if missing_mentee_common or missing_mentee_specific:
     all_missing_mentee = missing_mentee_common + missing_mentee_specific
     raise ValueError(f"Mentees CSV missing required columns: {all_missing_mentee}")
 
 print(f"Loaded {len(mentors)} mentors and {len(mentees)} mentees")
 
-# =========================
+# =
 # DATA PREPROCESSING
-# =========================
+# =
+
 print("Preprocessing data...")
 
 def parse_comma_separated_to_set(value):
@@ -128,6 +166,50 @@ def parse_comma_separated_to_set(value):
         return set()
     return set(item.strip() for item in str(value).split(',') if item.strip())
 
+def parse_years_of_experience(value):
+    """Parse years of experience from various formats"""
+    if pd.isna(value):
+        return np.nan
+    
+    value_str = str(value).strip()
+    
+    # Handle ranges like "3-5", "6-8", etc.
+    if '-' in value_str:
+        try:
+            parts = value_str.split('-')
+            if len(parts) == 2:
+                # Take the average of the range
+                min_years = float(parts[0])
+                max_years = float(parts[1])
+                return (min_years + max_years) / 2
+        except:
+            pass
+    
+    # Handle "20+" format
+    if '+' in value_str:
+        try:
+            return float(value_str.replace('+', ''))
+        except:
+            pass
+    
+    # Try direct conversion
+    try:
+        return float(value_str)
+    except:
+        return np.nan
+
+# Convert timezone strings to numeric offsets
+mentors["Offset"] = mentors["Timezones"].apply(parse_timezone_to_offset)
+mentees["Offset"] = mentees["Timezones"].apply(parse_timezone_to_offset)
+
+# Parse years of experience
+mentors["Avg Year of YOE"] = mentors["Years of Experience"].apply(parse_years_of_experience)
+mentees["Avg Year of YOE"] = mentees["Years of Experience"].apply(parse_years_of_experience)
+
+# Add Full Name column using First Name + Last Name
+mentors["Full Name"] = mentors["First Name"].astype(str) + " " + mentors["Last Name"].astype(str)
+mentees["Full Name"] = mentees["First Name"].astype(str) + " " + mentees["Last Name"].astype(str)
+
 # These columns contain multiple selections that need to be compared for overlaps
 multi_select_columns = [
     "Roles", 
@@ -141,12 +223,6 @@ multi_select_columns = [
 for column in multi_select_columns:
     mentors[column] = mentors[column].apply(parse_comma_separated_to_set)
     mentees[column] = mentees[column].apply(parse_comma_separated_to_set)
-
-# Convert string numbers to actual numeric types for mathematical operations
-numeric_columns = ["Offset", "Avg Year of YOE"]
-for column in numeric_columns:
-    mentors[column] = pd.to_numeric(mentors[column], errors='coerce')
-    mentees[column] = pd.to_numeric(mentees[column], errors='coerce')
 
 # Clean and standardize text fields (important attributes and preferences)
 important_attribute_columns = [
@@ -164,9 +240,10 @@ for column in important_attribute_columns:
 mentors["Time Slot Preference"] = mentors["Time Slot Preference"].fillna("No Preference").astype(str).str.strip()
 mentees["Time Slot Preference"] = mentees["Time Slot Preference"].fillna("No Preference").astype(str).str.strip()
 
-# =========================
+# =
 # SENTIMENT ANALYSIS SETUP
-# =========================
+# =
+
 print("Setting up sentiment analysis...")
 
 # Initialize NLTK's VADER sentiment analyzer
@@ -195,14 +272,14 @@ def calculate_sentiment_score(text):
 mentors["Sentiment"] = mentors["Open Answer"].fillna("").apply(calculate_sentiment_score)
 mentees["Sentiment"] = mentees["Open Answer"].fillna("").apply(calculate_sentiment_score)
 
-# =========================
+# =
 # UTC TIME SLOT OVERLAP SYSTEM (ENHANCED FEATURE)
-# =========================
+# =
+
 print("Setting up UTC-based time slot matching...")
 
 """
 TIME SLOT OVERLAP LOGIC:
-
 Instead of just matching labels like "Morning" with "Morning", we now:
 1. Convert each person's time slot preference to actual UTC hours based on their timezone
 2. Calculate the intersection of available hours between mentor and mentee
@@ -311,12 +388,12 @@ def calculate_utc_availability_overlap_bonus(mentor_slot, mentor_offset, mentee_
     
     return total_bonus
 
-# =========================
+# =
 # SCORING SYSTEM CONFIGURATION
-# =========================
+# =
+
 """
 SCORING WEIGHTS: Higher weights = more important for matching
-
 These weights determine how much each type of similarity contributes to the match score.
 They're based on business requirements and can be tuned based on matching outcomes.
 """
@@ -448,7 +525,7 @@ def compute_overall_match_score(mentor_row, mentee_row):
     - -infinity: impossible match (fails hard constraints)
     """
     
-    # ===== HARD CONSTRAINTS (MUST PASS) =====
+    # = HARD CONSTRAINTS (MUST PASS) =
     
     # Time zone constraint: must be within ±2 hours for practical scheduling
     mentor_tz = mentor_row["Offset"]
@@ -468,7 +545,7 @@ def compute_overall_match_score(mentor_row, mentee_row):
     if experience_bonus == -np.inf:
         return -np.inf
     
-    # ===== SCORE CALCULATION (ADD POINTS FOR COMPATIBILITY) =====
+    # = SCORE CALCULATION (ADD POINTS FOR COMPATIBILITY) =
     
     total_score = BASE_SCORE
     
@@ -530,11 +607,11 @@ def compute_overall_match_score(mentor_row, mentee_row):
     
     return total_score
 
-# =========================
+# =
 # PAIRWISE SCORE COMPUTATION
-# =========================
-print("Computing compatibility scores for all mentor-mentee pairs...")
+# =
 
+print("Computing compatibility scores for all mentor-mentee pairs...")
 mentor_indices = mentors.index.tolist()
 mentee_indices = mentees.index.tolist()
 pair_compatibility_scores = {}
@@ -555,14 +632,14 @@ for mentor_idx in mentor_indices:
 if not pair_compatibility_scores:
     raise ValueError("No valid matches found under current constraints. Check your data and business rules.")
 
-# =========================
+# =
 # OPTIMIZATION SETUP (LINEAR PROGRAMMING)
-# =========================
+# =
+
 print("Setting up optimization problem...")
 
 """
 OPTIMIZATION PROBLEM FORMULATION:
-
 This is a "Maximum Weight Matching" problem with additional constraints.
 We use Mixed Integer Linear Programming (MILP) to find the globally optimal solution.
 
@@ -590,9 +667,10 @@ for (mentor_idx, mentee_idx) in pair_compatibility_scores.keys():
     var_name = f"x_{mentor_idx}_{mentee_idx}"
     matching_variables[(mentor_idx, mentee_idx)] = solver.BoolVar(var_name)
 
-# =========================
+# =
 # OPTIMIZATION CONSTRAINTS
-# =========================
+# =
+
 print("Adding business constraints...")
 
 # CONSTRAINT 1: Each mentee can have at most 1 mentor
@@ -621,9 +699,10 @@ for mentor_idx in mentor_indices:
     if potential_matches:  # Only add constraint if there are potential matches
         solver.Add(solver.Sum(potential_matches) <= 2)
 
-# =========================
+# =
 # OPTIMIZATION OBJECTIVE
-# =========================
+# =
+
 print("Setting optimization objective...")
 
 # OBJECTIVE: Maximize total compatibility score across all matches
@@ -635,11 +714,11 @@ for (mentor_idx, mentee_idx), compatibility_score in pair_compatibility_scores.i
 
 solver.Maximize(solver.Sum(objective_terms))
 
-# =========================
+# =
 # SOLVE OPTIMIZATION PROBLEM
-# =========================
-print("Solving optimization problem...")
+# =
 
+print("Solving optimization problem...")
 solution_status = solver.Solve()
 
 if solution_status != pywraplp.Solver.OPTIMAL:
@@ -647,9 +726,10 @@ if solution_status != pywraplp.Solver.OPTIMAL:
 
 print("Optimal solution found!")
 
-# =========================
+# =
 # EXTRACT SOLUTION & PREPARE OUTPUT
-# =========================
+# =
+
 print("Extracting matches and preparing output...")
 
 # Determine which mentor-mentee pairs were selected in the optimal solution
@@ -658,9 +738,10 @@ for (mentor_idx, mentee_idx), decision_variable in matching_variables.items():
     if decision_variable.solution_value() > 0.5:  # Variable is set to 1 (matched)
         mentor_to_mentees_mapping[mentor_idx].append(mentee_idx)
 
-# =========================
+# =
 # OUTPUT FORMATTING WITH COMPREHENSIVE DUPLICATE PREVENTION
-# =========================
+# =
+
 """
 OUTPUT FORMAT:
 - Each mentor gets one row (with blank match score)
@@ -728,7 +809,7 @@ for mentor_idx in sorted(mentor_to_mentees_mapping.keys(), key=get_mentor_sort_k
         mentor_output_row = {
             "Row Type": "Mentor",
             "Name": mentor_data.get("Full Name", ""),
-            "Email": mentor_data.get("Coda Email", ""),
+            "Email": mentor_data.get("Coda Email", ""),  # Updated column name
             "Submission ID": mentor_submission_id,  # Map from mentor-specific column
             "Match Score": ""  # Blank for mentor rows
         }
@@ -754,7 +835,7 @@ for mentor_idx in sorted(mentor_to_mentees_mapping.keys(), key=get_mentor_sort_k
                 mentee_output_row = {
                     "Row Type": "Mentee", 
                     "Name": mentee_data.get("Full Name", ""),
-                    "Email": mentee_data.get("Coda Email", ""),
+                    "Email": mentee_data.get("Coda Email", ""),  # Updated column name
                     "Submission ID": mentee_submission_id,  # Map from mentee-specific column
                     "Match Score": round(match_score, 2)  # Show match score on mentee rows
                 }
@@ -765,27 +846,26 @@ for mentor_idx in sorted(mentor_to_mentees_mapping.keys(), key=get_mentor_sort_k
                 
                 output_data_rows.append(mentee_output_row)
 
-# =========================
+# =
 # FINAL SAFETY NET: NUCLEAR DUPLICATE REMOVAL
-# =========================
+# =
+
 """
 FINAL DEDUPLICATION LAYER:
-
 Even though our generation logic should prevent duplicates, we add a final safety net
 that removes any remaining duplicates based on Submission ID. This ensures 100%
 certainty that no duplicates exist in the final output.
 """
-
 final_output_df = pd.DataFrame(output_data_rows)
 
 # NUCLEAR OPTION: Final deduplication by submission ID (keeps first occurrence)
 final_output_df = final_output_df.drop_duplicates(subset=['Submission ID'], keep='first')
 
-# =========================
+# =
 # SAVE OUTPUT FILE
-# =========================
-print("Saving results...")
+# =
 
+print("Saving results...")
 final_output_df.to_csv(OUTPUT_CSV, index=False)
 
 print(f"✅ Matching complete! Results saved to: {OUTPUT_CSV}")
