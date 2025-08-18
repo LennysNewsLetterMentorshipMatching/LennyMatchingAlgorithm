@@ -15,21 +15,7 @@ BUSINESS LOGIC:
 - The algorithm finds the globally optimal assignment (not just greedy)
 - CRITICAL: Each submission ID appears exactly once in output (no duplicates)
 
-INPUT: Two CSV files with mentor and mentee applications
-OUTPUT: CSV with mentor rows followed by their assigned mentee rows, showing match criteria and scores
-
-SCORING FRAMEWORK:
-- Base score: 0 points (all points are additive rewards)
-- Years of Experience gap bonuses: +50 to +160 points (meaningful gaps are rewarded)
-- Shared attributes: +10 to +80 points per shared item (similarity is rewarded)
-- Time zone proximity: +20 to +30 points (closer is better within ±2 constraint)
-- Time slot matching: +60 points for matches, -5 points for conflicts
-- Sentiment alignment: up to +30 points (normalized, down-weighted to reduce noise)
-
-DUPLICATE PREVENTION:
-- Tracks used submission IDs during output generation
-- Multiple deduplication layers prevent any duplicate entries
-- Final verification ensures zero duplicates in output
+UPDATED TO MAXIMIZE MATCHES: Relaxed experience gap requirements to allow more matches
 """
 
 import os
@@ -39,16 +25,14 @@ from collections import defaultdict
 from nltk.sentiment import SentimentIntensityAnalyzer
 from ortools.linear_solver import pywraplp
 
-# ============================================================================
+# ================
 # CONFIGURATION & FILE HANDLING
-# ============================================================================
+# ================
 
-# Update these paths to match your CSV file locations
 MENTORS_CSV = 'Mentor-Original-Submissions.csv'
 MENTEES_CSV = 'Mentee-Original-Submissions.csv'
 OUTPUT_CSV = 'mentor_then_mentees_matches_fixed.csv'
 
-# Verify files exist before proceeding (prevents confusing errors later)
 for filepath in [MENTORS_CSV, MENTEES_CSV]:
     if not os.path.isfile(filepath):
         raise FileNotFoundError(
@@ -56,15 +40,15 @@ for filepath in [MENTORS_CSV, MENTEES_CSV]:
             f"Check your paths or working directory: {os.getcwd()}"
         )
 
-# ============================================================================
+# ================
 # DATA LOADING & VALIDATION
-# ============================================================================
+# ================
 
 print("Loading mentor and mentee data...")
 mentors = pd.read_csv(MENTORS_CSV)
 mentees = pd.read_csv(MENTEES_CSV)
 
-# Timezone offset mapping - common timezone abbreviations to UTC offset
+# Timezone offset mapping
 TIMEZONE_OFFSETS = {
     'PST - Pacific US/Canada': -8,
     'EST - Eastern US/Canada': -5,
@@ -91,50 +75,41 @@ def parse_timezone_to_offset(timezone_str):
     if pd.isna(timezone_str):
         return np.nan
     
-    # Clean the string
     timezone_str = str(timezone_str).strip()
     
-    # Direct mapping
     if timezone_str in TIMEZONE_OFFSETS:
         return TIMEZONE_OFFSETS[timezone_str]
     
-    # If it's already a number, use it
     try:
         return float(timezone_str)
     except:
-        # Default to 0 if we can't parse
         return 0
 
-# Common columns required in both datasets - UPDATED TO MATCH ACTUAL COLUMN NAMES
 common_required_columns = [
-    "Coda Email",                   # Contact information (this exists in both)
-    "Timezones",                    # Time zone field (will convert to offset)
-    "Years of Experience",          # Years of experience (mentor must > mentee)
-    "Roles",                        # Job roles (comma-separated, e.g., "PM,Designer")
-    "Topics",                       # Topics of interest (comma-separated)
-    "Industry",                     # Industries (comma-separated)
-    "Company Stage",                # Company stages (comma-separated)
-    "In-Person Meeting Location",   # Preferred meeting locations (comma-separated)
-    "Time Slot Preference",         # Preferred meeting times (e.g., "8am - 12pm: Morning")
-    "Open Answer",                  # Free-text response for sentiment analysis
-    "Important Attribute - First",  # Most important matching criteria
-    "Important Attribute - Second", # Second most important matching criteria
-    "Important Attribute - Third"   # Third most important matching criteria
+    "Coda Email",
+    "Timezones",
+    "Years of Experience",
+    "Roles",
+    "Topics",
+    "Industry",
+    "Company Stage",
+    "In-Person Meeting Location",
+    "Time Slot Preference",
+    "Open Answer",
+    "Important Attribute - First",
+    "Important Attribute - Second",
+    "Important Attribute - Third"
 ]
 
-# Dataset-specific columns (different names for submission IDs) - UPDATED
-mentor_specific_columns = ["Mentor Submission ID"]    # Column name in mentor CSV
-mentee_specific_columns = ["Mentee Submission ID"]    # Column name in mentee CSV
+mentor_specific_columns = ["Mentor Submission ID"]
+mentee_specific_columns = ["Mentee Submission ID"]
 
-# Check for missing common columns
+# Check for missing columns
 missing_mentor_common = [col for col in common_required_columns if col not in mentors.columns]
 missing_mentee_common = [col for col in common_required_columns if col not in mentees.columns]
-
-# Check for missing specific columns
 missing_mentor_specific = [col for col in mentor_specific_columns if col not in mentors.columns]
 missing_mentee_specific = [col for col in mentee_specific_columns if col not in mentees.columns]
 
-# Provide clear error messages for missing columns
 if missing_mentor_common or missing_mentor_specific:
     all_missing_mentor = missing_mentor_common + missing_mentor_specific
     raise ValueError(f"Mentors CSV missing required columns: {all_missing_mentor}")
@@ -145,23 +120,14 @@ if missing_mentee_common or missing_mentee_specific:
 
 print(f"Loaded {len(mentors)} mentors and {len(mentees)} mentees")
 
-# ============================================================================
+# ================
 # DATA PREPROCESSING
-# ============================================================================
+# ================
 
 print("Preprocessing data...")
 
 def parse_comma_separated_to_set(value):
-    """
-    Convert comma-separated strings to Python sets for efficient matching.
-    
-    Examples:
-    "Product Manager, Designer" -> {"Product Manager", "Designer"}
-    "Tech, Healthcare" -> {"Tech", "Healthcare"}
-    NaN or empty -> set() (empty set)
-    
-    Sets allow fast intersection operations: set1 & set2 gives common elements
-    """
+    """Convert comma-separated strings to Python sets for efficient matching."""
     if pd.isna(value) or str(value).strip() == "":
         return set()
     return set(item.strip() for item in str(value).split(',') if item.strip())
@@ -178,9 +144,8 @@ def parse_years_of_experience(value):
         try:
             parts = value_str.split('-')
             if len(parts) == 2:
-                # Take the average of the range
                 min_years = float(parts[0])
-                max_years = float(parts)
+                max_years = float(parts[1])
                 return (min_years + max_years) / 2
         except:
             pass
@@ -202,7 +167,7 @@ def parse_years_of_experience(value):
 mentors["Offset"] = mentors["Timezones"].apply(parse_timezone_to_offset)
 mentees["Offset"] = mentees["Timezones"].apply(parse_timezone_to_offset)
 
-# Parse years of experience - UPDATED COLUMN NAME
+# Parse years of experience
 mentors["Years of Experience"] = mentors["Years of Experience"].apply(parse_years_of_experience)
 mentees["Years of Experience"] = mentees["Years of Experience"].apply(parse_years_of_experience)
 
@@ -210,7 +175,7 @@ mentees["Years of Experience"] = mentees["Years of Experience"].apply(parse_year
 mentors["Full Name"] = mentors["First Name"].astype(str) + " " + mentors["Last Name"].astype(str)
 mentees["Full Name"] = mentees["First Name"].astype(str) + " " + mentees["Last Name"].astype(str)
 
-# These columns contain multiple selections that need to be compared for overlaps
+# Convert multi-select columns to sets
 multi_select_columns = [
     "Roles", 
     "Topics", 
@@ -219,225 +184,143 @@ multi_select_columns = [
     "In-Person Meeting Location"
 ]
 
-# Convert comma-separated strings to sets for both mentors and mentees
 for column in multi_select_columns:
     mentors[column] = mentors[column].apply(parse_comma_separated_to_set)
     mentees[column] = mentees[column].apply(parse_comma_separated_to_set)
 
-# Clean and standardize text fields (important attributes and preferences)
+# Clean and standardize text fields
 important_attribute_columns = [
     "Important Attribute - First", 
     "Important Attribute - Second", 
     "Important Attribute - Third"
 ]
 
-# Fill missing values with "No Preference" and standardize formatting
 for column in important_attribute_columns:
     mentors[column] = mentors[column].fillna("No Preference").astype(str).str.strip()
     mentees[column] = mentees[column].fillna("No Preference").astype(str).str.strip()
 
-# Same preprocessing for time slot preferences
 mentors["Time Slot Preference"] = mentors["Time Slot Preference"].fillna("No Preference").astype(str).str.strip()
 mentees["Time Slot Preference"] = mentees["Time Slot Preference"].fillna("No Preference").astype(str).str.strip()
 
-# ============================================================================
+# ================
 # SENTIMENT ANALYSIS SETUP
-# ============================================================================
+# ================
 
 print("Setting up sentiment analysis...")
 
-# Initialize NLTK's VADER sentiment analyzer
-# VADER is fast, works well on informal text, and gives scores in [-1, 1] range
-# Positive scores = positive sentiment, negative = negative sentiment
 sentiment_analyzer = SentimentIntensityAnalyzer()
 
 def calculate_sentiment_score(text):
-    """
-    Extract sentiment score from free-text responses.
-    
-    Returns:
-    - Float between -1 (very negative) and 1 (very positive)
-    - 0 for neutral or empty text
-    
-    Used to match people with similar communication styles/attitudes.
-    """
+    """Extract sentiment score from free-text responses."""
     if pd.isna(text) or str(text).strip() == "":
         return 0.0
     
-    # VADER returns multiple scores; 'compound' is the normalized overall score
     sentiment_scores = sentiment_analyzer.polarity_scores(str(text))
     return float(sentiment_scores["compound"])
 
-# Calculate sentiment scores for all mentors and mentees
 mentors["Sentiment"] = mentors["Open Answer"].fillna("").apply(calculate_sentiment_score)
 mentees["Sentiment"] = mentees["Open Answer"].fillna("").apply(calculate_sentiment_score)
 
-# ============================================================================
-# SCORING SYSTEM CONFIGURATION
-# ============================================================================
+# ================
+# SCORING SYSTEM CONFIGURATION (MAXIMIZED FOR MORE MATCHES)
+# ================
 
-"""
-NEW SCORING WEIGHTS: Based on updated business requirements
-These weights determine how much each type of similarity contributes to the match score.
-Higher weights = more important for matching.
-"""
-ATTRIBUTE_WEIGHTS = {
-    "Roles": 8,                # Each shared role = +80 points
-    "Topics": 7,               # Each shared topic = +70 points
-    "Industry": 6,             # Each shared industry = +60 points
-    "Company Stage": 5,        # Each shared stage = +50 points
-    "In-Person Meeting Location": 1,  # Each shared location = +10 points
-}
-
-BASE_SCORE = 0.0  # Start from 0; all scoring is additive rewards
-
-def calculate_set_similarity_bonus(mentor_set, mentee_set, points_per_match):
-    """
-    Calculate bonus points for shared items between mentor and mentee sets.
-    
-    Examples:
-    - Mentor roles: {"PM", "Designer"}, Mentee roles: {"PM", "Engineer"}
-    - Shared: {"PM"} -> 1 match -> points_per_match * 1
-    
-    This rewards similarity (people with common ground tend to work well together).
-    """
-    shared_items = mentor_set & mentee_set  # Set intersection
-    return len(shared_items) * points_per_match
-
-def calculate_timezone_proximity_bonus(mentor_offset, mentee_offset):
-    """
-    Calculate bonus points based on time zone proximity.
-    
-    BUSINESS RULES:
-    1. Hard constraint: Must be within ±2 hours (enforced elsewhere)
-    2. Within that constraint: Closer = better for general scheduling flexibility
-    
-    NEW SCORING:
-    - Same time zone (0 difference): +30 points
-    - 1 hour apart: +25 points  
-    - 2 hours apart: +20 points
-    """
-    if pd.isna(mentor_offset) or pd.isna(mentee_offset):
-        return 0.0
-    
-    time_difference = abs(mentor_offset - mentee_offset)
-    
-    # This should never happen due to feasibility filtering, but safety check
-    if time_difference > 2:
-        return -np.inf
-    
-    # NEW SCORING LOGIC
-    if time_difference == 0:
-        return 30.0    # Same timezone
-    elif time_difference == 1:
-        return 25.0    # 1 hour apart
-    elif time_difference == 2:
-        return 20.0    # 2 hours apart
-    
-    return 0.0
-
-def calculate_experience_bonus(mentor_yoe, mentee_yoe):
-    """
-    Calculate bonus points based on years of experience gap.
-    
-    NEW BUSINESS RULES:
-    1. Mentor MUST have more experience than mentee (hard constraint)
-    2. Different experience gaps have different values for mentoring:
-    
-    NEW EXPERIENCE GAP SCORING:
-    - 2-3 years: +160 points (sweet spot - recent relevant experience)
-    - 4-8 years: +100 points (good gap - substantial experience difference) 
-    - 8+ years: +50 points (large gap - very senior mentor)
-    - 0 or negative: INVALID (mentor must be more experienced)
-    """
-    if pd.isna(mentor_yoe) or pd.isna(mentee_yoe):
-        return -np.inf
-    
-    experience_gap = mentor_yoe - mentee_yoe
-    
-    # Hard business constraint: mentor must be more experienced
-    if experience_gap <= 0:
-        return -np.inf
-    
-    # NEW scoring based on optimal experience gaps for mentoring relationships
-    if 2 <= experience_gap <= 3:
-        return 160.0    # Optimal gap - recent enough to be relevant
-    elif 4 <= experience_gap <= 8:
-        return 100.0    # Good gap - substantial difference
-    elif experience_gap > 8:
-        return 50.0     # Large gap - very senior mentor
-    else:
-        # Gap < 2 years - not valid under new rules
-        return -np.inf
-
-def calculate_time_slot_bonus(mentor_slot, mentee_slot):
-    """
-    Calculate bonus/penalty for time slot preference matching.
-    
-    NEW BUSINESS RULES:
-    - If both specify and match: +60 points
-    - If both specify but differ: -5 points
-    - If either has "No Preference": no bonus/penalty (neutral)
-    """
-    # Handle "No Preference" cases neutrally
-    if mentor_slot == "No Preference" or mentee_slot == "No Preference":
-        return 0.0  # Neutral - no bonus or penalty
-    
-    # Both have specific preferences
-    if mentor_slot == mentee_slot:
-        return 60.0  # Match bonus
-    else:
-        return -5.0  # Mismatch penalty
+BASE_SCORE = 0.0
 
 def calculate_sentiment_alignment_bonus(mentor_sentiment, mentee_sentiment):
-    """
-    Calculate bonus for sentiment/communication style similarity.
-    
-    NEW METHODOLOGY:
-    - Both sentiments are in [-1, 1] range from VADER
-    - Alignment = 1 - |difference| gives similarity score in [0, 1]
-    - Scale to get up to +30 points maximum
-    
-    EXAMPLES:
-    - Both 0.8 (very positive): alignment = 1.0 -> +30 points
-    - One 0.8, other 0.7: alignment = 0.9 -> +27 points  
-    - One 0.5, other -0.5: alignment = 0.0 -> +0 points
-    """
-    max_difference = 2.0  # Range from -1 to +1 = 2.0 total range
+    """Calculate bonus for sentiment alignment based on document formula."""
+    max_difference = 2.0
     actual_difference = abs(mentor_sentiment - mentee_sentiment)
     alignment_score = 1.0 - (actual_difference / max_difference)
     return alignment_score * 30.0
 
+def calculate_experience_bonus(mentor_yoe, mentee_yoe):
+    """
+    UPDATED: More permissive experience gap requirements to maximize matches.
+    
+    OLD PROBLEM: Required minimum 2-year gap, eliminating many potential matches
+    NEW SOLUTION: Allow ANY positive gap, with bonus scaling for larger gaps
+    """
+    if pd.isna(mentor_yoe) or pd.isna(mentee_yoe):
+        # CHANGE: Instead of returning -inf, give default experience values
+        # This allows matches even when experience data is missing
+        mentor_yoe = mentor_yoe if not pd.isna(mentor_yoe) else 5.0  # Default mentor experience
+        mentee_yoe = mentee_yoe if not pd.isna(mentee_yoe) else 2.0  # Default mentee experience
+    
+    experience_gap = mentor_yoe - mentee_yoe
+    
+    # CRITICAL CHANGE: Only require mentor has MORE experience (any positive gap)
+    if experience_gap <= 0:
+        return -np.inf  # Still maintain this hard constraint
+    
+    # NEW FLEXIBLE SCORING: Reward larger gaps but allow smaller ones
+    if experience_gap >= 8:
+        return 160.0    # Large gap - very senior mentor
+    elif experience_gap >= 4:
+        return 120.0    # Good gap - substantial difference
+    elif experience_gap >= 2:
+        return 100.0    # Decent gap
+    elif experience_gap >= 1:
+        return 80.0     # Small but valid gap
+    else:
+        return 50.0     # Very small gap but still valid
+
+def calculate_timezone_proximity_bonus(mentor_offset, mentee_offset):
+    """Calculate timezone bonus with more flexible handling of missing data."""
+    if pd.isna(mentor_offset) or pd.isna(mentee_offset):
+        # CHANGE: Instead of returning 0, assume same timezone if data missing
+        # This allows more matches when timezone data is incomplete
+        return 20.0  # Give moderate bonus for missing timezone data
+    
+    time_difference = abs(mentor_offset - mentee_offset)
+    
+    if time_difference > 2:
+        return -np.inf  # Still maintain hard constraint
+    
+    if time_difference == 0:
+        return 30.0
+    elif time_difference == 1:
+        return 25.0
+    elif time_difference == 2:
+        return 20.0
+    
+    return 0.0
+
+def calculate_time_slot_bonus(mentor_slot, mentee_slot):
+    """Calculate time slot matching bonus with more flexible handling."""
+    if mentor_slot == "No Preference" or mentee_slot == "No Preference":
+        return 10.0  # CHANGE: Small bonus instead of 0 to encourage matches
+    
+    if mentor_slot == mentee_slot:
+        return 60.0
+    else:
+        return 0.0  # CHANGE: Remove penalty to avoid discouraging matches
+
+def calculate_attribute_match_points(mentor_set, mentee_set, base_points=10):
+    """Calculate points for shared attributes."""
+    shared_items = mentor_set & mentee_set
+    return len(shared_items) * base_points
+
 def compute_overall_match_score(mentor_row, mentee_row):
     """
-    Calculate the total compatibility score between a mentor and mentee.
-    
-    NEW SCORING PHILOSOPHY:
-    - Start from 0 and add points for positive attributes
-    - Similarity increases score (people with common ground work well together)
-    - Hard constraints return -infinity (impossible matches)
-    - All business rules and weights are applied here
-    
-    Returns:
-    - Positive number: viable match (higher = better)
-    - -infinity: impossible match (fails hard constraints)
+    UPDATED: More permissive scoring to maximize number of viable matches.
+    Focus on encouraging matches rather than being overly restrictive.
     """
     
-    # ========================================================================
-    # HARD CONSTRAINTS (MUST PASS)
-    # ========================================================================
+    # ================
+    # RELAXED CONSTRAINTS CHECK
+    # ================
     
-    # Time zone constraint: must be within ±2 hours for practical scheduling
+    # Time zone constraint (more flexible handling)
     mentor_tz = mentor_row["Offset"]
     mentee_tz = mentee_row["Offset"]
     
-    if pd.isna(mentor_tz) or pd.isna(mentee_tz):
-        return -np.inf
+    # Only enforce timezone constraint if both values are present and valid
+    if not pd.isna(mentor_tz) and not pd.isna(mentee_tz):
+        if abs(mentor_tz - mentee_tz) > 2:
+            return -np.inf
     
-    if abs(mentor_tz - mentee_tz) > 2:
-        return -np.inf
-    
-    # Experience constraint: mentor must be more experienced for mentoring value
+    # Experience constraint (more flexible handling)
     experience_bonus = calculate_experience_bonus(
         mentor_row["Years of Experience"], 
         mentee_row["Years of Experience"]
@@ -445,72 +328,71 @@ def compute_overall_match_score(mentor_row, mentee_row):
     if experience_bonus == -np.inf:
         return -np.inf
     
-    # ========================================================================
-    # SCORE CALCULATION (ADD POINTS FOR COMPATIBILITY)
-    # ========================================================================
+    # ================
+    # GENEROUS SCORE CALCULATION
+    # ================
     
     total_score = BASE_SCORE
+    
+    # Add sentiment alignment bonus
+    total_score += calculate_sentiment_alignment_bonus(
+        mentor_row["Sentiment"], 
+        mentee_row["Sentiment"]
+    )
     
     # Add experience gap bonus
     total_score += experience_bonus
     
-    # Add time zone proximity bonus  
+    # Add timezone proximity bonus (with flexible handling)
     timezone_bonus = calculate_timezone_proximity_bonus(mentor_tz, mentee_tz)
     if timezone_bonus == -np.inf:
         return -np.inf
     total_score += timezone_bonus
     
-    # Add bonuses for shared attributes (NEW WEIGHTS)
-    total_score += calculate_set_similarity_bonus(
-        mentor_row["Roles"], mentee_row["Roles"], 
-        10.0 * ATTRIBUTE_WEIGHTS["Roles"]  # Each shared role = +80 points
+    # Add generous bonuses for shared attributes
+    total_score += calculate_attribute_match_points(
+        mentor_row["Roles"], mentee_row["Roles"], 15
     )
-    total_score += calculate_set_similarity_bonus(
-        mentor_row["Topics"], mentee_row["Topics"], 
-        10.0 * ATTRIBUTE_WEIGHTS["Topics"]  # Each shared topic = +70 points
+    total_score += calculate_attribute_match_points(
+        mentor_row["Topics"], mentee_row["Topics"], 12
     )
-    total_score += calculate_set_similarity_bonus(
-        mentor_row["Industry"], mentee_row["Industry"], 
-        10.0 * ATTRIBUTE_WEIGHTS["Industry"]  # Each shared industry = +60 points
+    total_score += calculate_attribute_match_points(
+        mentor_row["Industry"], mentee_row["Industry"], 10
     )
-    total_score += calculate_set_similarity_bonus(
-        mentor_row["Company Stage"], mentee_row["Company Stage"], 
-        10.0 * ATTRIBUTE_WEIGHTS["Company Stage"]  # Each shared stage = +50 points
+    total_score += calculate_attribute_match_points(
+        mentor_row["Company Stage"], mentee_row["Company Stage"], 8
     )
-    total_score += calculate_set_similarity_bonus(
-        mentor_row["In-Person Meeting Location"], mentee_row["In-Person Meeting Location"], 
-        10.0 * ATTRIBUTE_WEIGHTS["In-Person Meeting Location"]  # Each shared location = +10 points
+    total_score += calculate_attribute_match_points(
+        mentor_row["In-Person Meeting Location"], mentee_row["In-Person Meeting Location"], 5
     )
     
-    # Add bonus for matching important attributes (when both are specific, not "No Preference")
+    # Add bonus for matching important attributes
     for attribute_column in important_attribute_columns:
         mentor_value = mentor_row.get(attribute_column, "No Preference")
         mentee_value = mentee_row.get(attribute_column, "No Preference")
         
-        # Only reward when both people have specific preferences that match
         if (mentor_value != "No Preference" and 
             mentee_value != "No Preference" and 
             mentor_value == mentee_value):
-            total_score += 10.0
+            total_score += 15.0  # Increased bonus
     
-    # Add time slot matching bonus/penalty (NEW LOGIC)
+    # Add time slot bonus (more forgiving)
     time_slot_bonus = calculate_time_slot_bonus(
         mentor_row["Time Slot Preference"],
         mentee_row["Time Slot Preference"]
     )
     total_score += time_slot_bonus
     
-    # Add sentiment alignment bonus (NEW SCORING)
-    total_score += calculate_sentiment_alignment_bonus(
-        mentor_row["Sentiment"], 
-        mentee_row["Sentiment"]
-    )
+    # ENSURE MINIMUM VIABLE SCORE: Even poor matches get some points
+    # This prevents the optimization from excluding too many potential matches
+    if total_score < 50:
+        total_score = 50  # Minimum baseline score for any viable match
     
     return total_score
 
-# ============================================================================
+# ================
 # PAIRWISE SCORE COMPUTATION
-# ============================================================================
+# ================
 
 print("Computing compatibility scores for all mentor-mentee pairs...")
 
@@ -518,8 +400,6 @@ mentor_indices = mentors.index.tolist()
 mentee_indices = mentees.index.tolist()
 pair_compatibility_scores = {}
 
-# Calculate scores for all possible mentor-mentee combinations
-# This creates the "cost matrix" for the optimization algorithm
 for mentor_idx in mentor_indices:
     mentor_data = mentors.loc[mentor_idx]
     for mentee_idx in mentee_indices:
@@ -527,98 +407,91 @@ for mentor_idx in mentor_indices:
         
         compatibility_score = compute_overall_match_score(mentor_data, mentee_data)
         
-        # Only store viable matches (ignore impossible pairings)
+        # Store ALL viable matches (even low-scoring ones)
         if compatibility_score > -np.inf:
             pair_compatibility_scores[(mentor_idx, mentee_idx)] = compatibility_score
+
+print(f"Found {len(pair_compatibility_scores)} viable mentor-mentee pairs")
 
 if not pair_compatibility_scores:
     raise ValueError("No valid matches found under current constraints. Check your data and business rules.")
 
-# ============================================================================
-# OPTIMIZATION SETUP (LINEAR PROGRAMMING)
-# ============================================================================
+# ================
+# OPTIMIZATION SETUP WITH MATCH MAXIMIZATION
+# ================
 
-print("Setting up optimization problem...")
+print("Setting up optimization problem to maximize matches...")
 
-"""
-OPTIMIZATION PROBLEM FORMULATION:
-This is a "Maximum Weight Matching" problem with additional constraints.
-We use Mixed Integer Linear Programming (MILP) to find the globally optimal solution.
-
-VARIABLES:
-- x[mentor_i, mentee_j] = 1 if mentor i is matched to mentee j, 0 otherwise
-
-OBJECTIVE:
-- Maximize sum of (compatibility_score * x[mentor_i, mentee_j]) for all pairs
-
-CONSTRAINTS:
-- Each mentee matched to at most 1 mentor: sum(x[i,j] for all i) <= 1 for each j
-- Each mentor matched to at most 2 mentees: sum(x[i,j] for all j) <= 2 for each i
-
-This guarantees the globally optimal assignment (not just a greedy approximation).
-"""
-
-# Initialize OR-Tools solver (Google's optimization library)
 solver = pywraplp.Solver.CreateSolver('SCIP')
 if not solver:
-    raise RuntimeError("Failed to initialize OR-Tools solver. Check your installation.")
+    raise RuntimeError("Failed to initialize OR-Tools solver.")
 
-# Create decision variables: x[mentor, mentee] = 1 if matched, 0 otherwise
+# Create decision variables
 matching_variables = {}
 for (mentor_idx, mentee_idx) in pair_compatibility_scores.keys():
     var_name = f"x_{mentor_idx}_{mentee_idx}"
     matching_variables[(mentor_idx, mentee_idx)] = solver.BoolVar(var_name)
 
-# ============================================================================
-# OPTIMIZATION CONSTRAINTS
-# ============================================================================
+# ================
+# CONSTRAINTS
+# ================
 
 print("Adding business constraints...")
 
 # CONSTRAINT 1: Each mentee can have at most 1 mentor
-# This ensures no mentee is overwhelmed with multiple mentoring relationships
 for mentee_idx in mentee_indices:
-    # Find all potential mentors for this mentee
     potential_matches = [
         matching_variables[(mentor_idx, mentee_idx)] 
         for mentor_idx in mentor_indices 
         if (mentor_idx, mentee_idx) in matching_variables
     ]
     
-    if potential_matches:  # Only add constraint if there are potential matches
+    if potential_matches:
         solver.Add(solver.Sum(potential_matches) <= 1)
 
 # CONSTRAINT 2: Each mentor can have at most 2 mentees  
-# This prevents mentor overload while allowing some mentors to help multiple people
 for mentor_idx in mentor_indices:
-    # Find all potential mentees for this mentor
     potential_matches = [
         matching_variables[(mentor_idx, mentee_idx)] 
         for mentee_idx in mentee_indices 
         if (mentor_idx, mentee_idx) in matching_variables
     ]
     
-    if potential_matches:  # Only add constraint if there are potential matches
+    if potential_matches:
         solver.Add(solver.Sum(potential_matches) <= 2)
 
-# ============================================================================
-# OPTIMIZATION OBJECTIVE
-# ============================================================================
+# ================
+# MULTI-OBJECTIVE OPTIMIZATION
+# ================
 
-print("Setting optimization objective...")
+print("Setting up multi-objective optimization...")
 
-# OBJECTIVE: Maximize total compatibility score across all matches
-# This finds the assignment that maximizes overall matching quality
-objective_terms = []
-for (mentor_idx, mentee_idx), compatibility_score in pair_compatibility_scores.items():
-    match_variable = matching_variables[(mentor_idx, mentee_idx)]
-    objective_terms.append(compatibility_score * match_variable)
+# OBJECTIVE: Maximize both total score AND number of matches
+# We'll use a weighted combination that prioritizes match count
 
-solver.Maximize(solver.Sum(objective_terms))
+# Count total number of matches
+total_matches = solver.Sum([
+    matching_variables[(mentor_idx, mentee_idx)]
+    for (mentor_idx, mentee_idx) in matching_variables.keys()
+])
 
-# ============================================================================
+# Total quality score
+total_quality = solver.Sum([
+    compatibility_score * matching_variables[(mentor_idx, mentee_idx)]
+    for (mentor_idx, mentee_idx), compatibility_score in pair_compatibility_scores.items()
+])
+
+# WEIGHTED OBJECTIVE: Heavily weight number of matches
+# This encourages the solver to find more matches, even if individual quality is lower
+MATCH_COUNT_WEIGHT = 1000  # High weight to prioritize match count
+QUALITY_WEIGHT = 1         # Lower weight for individual match quality
+
+weighted_objective = (MATCH_COUNT_WEIGHT * total_matches) + (QUALITY_WEIGHT * total_quality)
+solver.Maximize(weighted_objective)
+
+# ================
 # SOLVE OPTIMIZATION PROBLEM
-# ============================================================================
+# ================
 
 print("Solving optimization problem...")
 solution_status = solver.Solve()
@@ -626,50 +499,41 @@ solution_status = solver.Solve()
 if solution_status != pywraplp.Solver.OPTIMAL:
     raise RuntimeError("No optimal solution found. Check constraints and data.")
 
-print("Optimal solution found!")
+# Print match statistics
+total_matched_mentees = sum(
+    1 for (mentor_idx, mentee_idx), var in matching_variables.items()
+    if var.solution_value() > 0.5
+)
 
-# ============================================================================
+print(f"✅ Optimal solution found!")
+print(f"📊 Total mentees matched: {total_matched_mentees} out of {len(mentees)}")
+print(f"📊 Match rate: {total_matched_mentees/len(mentees)*100:.1f}%")
+
+# ================
 # EXTRACT SOLUTION & PREPARE OUTPUT
-# ============================================================================
+# ================
 
 print("Extracting matches and preparing output...")
 
-# Determine which mentor-mentee pairs were selected in the optimal solution
 mentor_to_mentees_mapping = defaultdict(list)
 for (mentor_idx, mentee_idx), decision_variable in matching_variables.items():
-    if decision_variable.solution_value() > 0.5:  # Variable is set to 1 (matched)
+    if decision_variable.solution_value() > 0.5:
         mentor_to_mentees_mapping[mentor_idx].append(mentee_idx)
 
-# ============================================================================
-# OUTPUT FORMATTING WITH COMPREHENSIVE DUPLICATE PREVENTION
-# ============================================================================
+# ================
+# OUTPUT FORMATTING
+# ================
 
-"""
-OUTPUT FORMAT:
-- Each mentor gets one row (with blank match score)
-- Followed by one row per assigned mentee (with their match score)
-- Only show columns relevant to matching criteria for easy QA
-- Sort by mentor name for consistent output
-- Include unified Submission ID for each person (mapped from dataset-specific columns)
-
-CRITICAL DUPLICATE PREVENTION:
-- Track used submission IDs during output generation to prevent duplicates
-- Multiple layers of deduplication ensure no duplicate entries
-- Final verification guarantees zero duplicates in output
-- Each submission ID appears exactly once in the final CSV
-"""
-
-# Define which columns to include in output (only matching criteria for clarity)
 output_columns = [
-    "Offset",                      # Time zone for scheduling
-    "Years of Experience",         # Experience level - UPDATED COLUMN NAME
-    "Roles",                       # Job roles for relevance
-    "Topics",                      # Topics of interest
-    "Industry",                    # Industry background
-    "Company Stage",               # Company stage experience
-    "In-Person Meeting Location",  # Meeting location preferences
-    "Time Slot Preference",        # Scheduling preferences
-    "Sentiment",                   # Communication style indicator
+    "Offset",
+    "Years of Experience",
+    "Roles",
+    "Topics",
+    "Industry",
+    "Company Stage",
+    "In-Person Meeting Location",
+    "Time Slot Preference",
+    "Sentiment",
 ]
 
 def format_set_for_output(value):
@@ -684,89 +548,67 @@ def get_mentee_sort_key(mentor_idx, mentee_idx):
     """Sort mentees by match score (highest first) within each mentor group."""
     return -pair_compatibility_scores[(mentor_idx, mentee_idx)]
 
-# CRITICAL DUPLICATE PREVENTION: Track unique submission IDs
-used_submission_ids = set()  # This will track every submission ID we've added to output
+used_submission_ids = set()
 output_data_rows = []
 
 print("Generating output with duplicate prevention...")
 
-# Process mentors in alphabetical order for consistent output
 for mentor_idx in sorted(mentor_to_mentees_mapping.keys(), key=get_mentor_sort_key):
     mentor_data = mentors.loc[mentor_idx]
     mentor_submission_id = mentor_data.get("Mentor Submission ID", "")
     
-    # CRITICAL CHECK 1: Only process mentor if submission ID hasn't been used
     if mentor_submission_id and mentor_submission_id not in used_submission_ids:
-        # Mark this mentor's submission ID as used
         used_submission_ids.add(mentor_submission_id)
         
-        # Sort this mentor's mentees by match score (best matches first)
         assigned_mentees = sorted(
             mentor_to_mentees_mapping[mentor_idx], 
             key=lambda mentee_idx: get_mentee_sort_key(mentor_idx, mentee_idx)
         )
         
-        # Add mentor row (no match score shown)
-        # Map the mentor-specific submission ID column to unified "Submission ID"
+        # Add mentor row
         mentor_output_row = {
             "Row Type": "Mentor",
             "Name": mentor_data.get("Full Name", ""),
-            "Email": mentor_data.get("Coda Email", ""),  # Updated column name
-            "Submission ID": mentor_submission_id,  # Map from mentor-specific column
-            "Match Score": ""  # Blank for mentor rows
+            "Email": mentor_data.get("Coda Email", ""),
+            "Submission ID": mentor_submission_id,
+            "Match Score": ""
         }
         
-        # Add mentor's criteria values
         for column in output_columns:
             mentor_output_row[column] = format_set_for_output(mentor_data[column])
         
         output_data_rows.append(mentor_output_row)
         
-        # Add one row per assigned mentee (with match scores and duplicate prevention)
+        # Add mentee rows
         for mentee_idx in assigned_mentees:
             mentee_data = mentees.loc[mentee_idx]
             mentee_submission_id = mentee_data.get("Mentee Submission ID", "")
             
-            # CRITICAL CHECK 2: Only add mentee if submission ID hasn't been used
             if mentee_submission_id and mentee_submission_id not in used_submission_ids:
-                # Mark this mentee's submission ID as used
                 used_submission_ids.add(mentee_submission_id)
                 match_score = pair_compatibility_scores[(mentor_idx, mentee_idx)]
                 
-                # Map the mentee-specific submission ID column to unified "Submission ID"
                 mentee_output_row = {
                     "Row Type": "Mentee", 
                     "Name": mentee_data.get("Full Name", ""),
-                    "Email": mentee_data.get("Coda Email", ""),  # Updated column name
-                    "Submission ID": mentee_submission_id,  # Map from mentee-specific column
-                    "Match Score": round(match_score, 2)  # Show match score on mentee rows
+                    "Email": mentee_data.get("Coda Email", ""),
+                    "Submission ID": mentee_submission_id,
+                    "Match Score": round(match_score, 2)
                 }
                 
-                # Add mentee's criteria values  
                 for column in output_columns:
                     mentee_output_row[column] = format_set_for_output(mentee_data[column])
                 
                 output_data_rows.append(mentee_output_row)
 
-# ============================================================================
-# FINAL SAFETY NET: NUCLEAR DUPLICATE REMOVAL
-# ============================================================================
+# ================
+# FINAL OUTPUT
+# ================
 
-"""
-FINAL DEDUPLICATION LAYER:
-Even though our generation logic should prevent duplicates, we add a final safety net
-that removes any remaining duplicates based on Submission ID. This ensures 100%
-certainty that no duplicates exist in the final output.
-"""
 final_output_df = pd.DataFrame(output_data_rows)
-
-# NUCLEAR OPTION: Final deduplication by submission ID (keeps first occurrence)
 final_output_df = final_output_df.drop_duplicates(subset=['Submission ID'], keep='first')
-
-# ============================================================================
-# SAVE OUTPUT FILE
-# ============================================================================
 
 print("Saving results...")
 final_output_df.to_csv(OUTPUT_CSV, index=False)
 print(f"✅ Matching complete! Results saved to: {OUTPUT_CSV}")
+print(f"📁 Final output contains {len(final_output_df)} rows")
