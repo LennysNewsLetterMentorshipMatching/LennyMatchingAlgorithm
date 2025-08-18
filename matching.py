@@ -11,7 +11,7 @@ BUSINESS LOGIC:
 - Mentors must have more years of experience than their mentees
 - Mentor and mentee must be within 2 time zones of each other
 - Similarity in roles, topics, industry, etc. INCREASES match quality
-- Time slot matching uses ACTUAL UTC overlap hours (not just label matching)
+- Time slot matching provides bonus for exact matches, penalty for conflicts
 - The algorithm finds the globally optimal assignment (not just greedy)
 - CRITICAL: Each submission ID appears exactly once in output (no duplicates)
 
@@ -20,10 +20,10 @@ OUTPUT: CSV with mentor rows followed by their assigned mentee rows, showing mat
 
 SCORING FRAMEWORK:
 - Base score: 0 points (all points are additive rewards)
-- Years of Experience gap: +50 to +160 points (bigger meaningful gaps are better)
+- Years of Experience gap bonuses: +50 to +160 points (meaningful gaps are rewarded)
 - Shared attributes: +10 to +80 points per shared item (similarity is rewarded)
 - Time zone proximity: +20 to +30 points (closer is better within ±2 constraint)
-- UTC time overlap: +8 points per overlapping hour (actual scheduling compatibility)
+- Time slot matching: +60 points for matches, -5 points for conflicts
 - Sentiment alignment: up to +30 points (normalized, down-weighted to reduce noise)
 
 DUPLICATE PREVENTION:
@@ -39,9 +39,9 @@ from collections import defaultdict
 from nltk.sentiment import SentimentIntensityAnalyzer
 from ortools.linear_solver import pywraplp
 
-# =
+# ============================================================================
 # CONFIGURATION & FILE HANDLING
-# =
+# ============================================================================
 
 # Update these paths to match your CSV file locations
 MENTORS_CSV = 'Mentor-Original-Submissions.csv'
@@ -56,9 +56,9 @@ for filepath in [MENTORS_CSV, MENTEES_CSV]:
             f"Check your paths or working directory: {os.getcwd()}"
         )
 
-# =
+# ============================================================================
 # DATA LOADING & VALIDATION
-# =
+# ============================================================================
 
 print("Loading mentor and mentee data...")
 mentors = pd.read_csv(MENTORS_CSV)
@@ -145,9 +145,9 @@ if missing_mentee_common or missing_mentee_specific:
 
 print(f"Loaded {len(mentors)} mentors and {len(mentees)} mentees")
 
-# =
+# ============================================================================
 # DATA PREPROCESSING
-# =
+# ============================================================================
 
 print("Preprocessing data...")
 
@@ -180,7 +180,7 @@ def parse_years_of_experience(value):
             if len(parts) == 2:
                 # Take the average of the range
                 min_years = float(parts[0])
-                max_years = float(parts[1])
+                max_years = float(parts)
                 return (min_years + max_years) / 2
         except:
             pass
@@ -202,9 +202,9 @@ def parse_years_of_experience(value):
 mentors["Offset"] = mentors["Timezones"].apply(parse_timezone_to_offset)
 mentees["Offset"] = mentees["Timezones"].apply(parse_timezone_to_offset)
 
-# Parse years of experience
-mentors["Avg Year of YOE"] = mentors["Years of Experience"].apply(parse_years_of_experience)
-mentees["Avg Year of YOE"] = mentees["Years of Experience"].apply(parse_years_of_experience)
+# Parse years of experience - UPDATED COLUMN NAME
+mentors["Years of Experience"] = mentors["Years of Experience"].apply(parse_years_of_experience)
+mentees["Years of Experience"] = mentees["Years of Experience"].apply(parse_years_of_experience)
 
 # Add Full Name column using First Name + Last Name
 mentors["Full Name"] = mentors["First Name"].astype(str) + " " + mentors["Last Name"].astype(str)
@@ -240,9 +240,9 @@ for column in important_attribute_columns:
 mentors["Time Slot Preference"] = mentors["Time Slot Preference"].fillna("No Preference").astype(str).str.strip()
 mentees["Time Slot Preference"] = mentees["Time Slot Preference"].fillna("No Preference").astype(str).str.strip()
 
-# =
+# ============================================================================
 # SENTIMENT ANALYSIS SETUP
-# =
+# ============================================================================
 
 print("Setting up sentiment analysis...")
 
@@ -272,142 +272,24 @@ def calculate_sentiment_score(text):
 mentors["Sentiment"] = mentors["Open Answer"].fillna("").apply(calculate_sentiment_score)
 mentees["Sentiment"] = mentees["Open Answer"].fillna("").apply(calculate_sentiment_score)
 
-# =
-# UTC TIME SLOT OVERLAP SYSTEM (ENHANCED FEATURE)
-# =
-
-print("Setting up UTC-based time slot matching...")
-
-"""
-TIME SLOT OVERLAP LOGIC:
-Instead of just matching labels like "Morning" with "Morning", we now:
-1. Convert each person's time slot preference to actual UTC hours based on their timezone
-2. Calculate the intersection of available hours between mentor and mentee
-3. Score based on number of overlapping hours (more overlap = better match)
-
-EXAMPLES:
-- PST "Morning" (8am-12pm local) = UTC hours {16, 17, 18, 19} (due to PST = UTC-8)
-- EST "Morning" (8am-12pm local) = UTC hours {13, 14, 15, 16} (due to EST = UTC-5)  
-- Overlap = {16} = 1 hour = +8 points
-
-This provides much more accurate scheduling compatibility than label matching alone.
-"""
-
-# Mapping from time slot labels to local hour ranges (24-hour format)
-# Each tuple represents (start_hour, end_hour) in the person's LOCAL timezone
-# end_hour is exclusive (e.g., (8, 12) means 8am, 9am, 10am, 11am)
-TIME_SLOT_DEFINITIONS = {
-    "8am - 12pm: Morning": (8, 12),
-    "12pm - 6pm: Afternoon": (12, 18),
-    "6pm - 10pm: Evening": (18, 22),
-    "10pm - 8am: After-hours": (22, 32),  # Spans midnight; 32 means 8am next day
-    
-    # Alternative formatting variations (for robustness)
-    "8am - 12pm Morning": (8, 12),
-    "12pm - 6pm Afternoon": (12, 18),
-    "6pm - 10pm Evening": (18, 22),
-    "10pm - 8am After-hours": (22, 32),
-    
-    # Handle edge cases
-    "Morning": (8, 12),
-    "Afternoon": (12, 18),
-    "Evening": (18, 22),
-    "After-hours": (22, 32),
-    
-    "No Preference": None  # Special case handled separately
-}
-
-def convert_local_timeslot_to_utc_hours(slot_label, timezone_offset_hours):
-    """
-    Convert a local time slot preference to a set of UTC hour blocks.
-    
-    Args:
-    - slot_label: String like "8am - 12pm: Morning" 
-    - timezone_offset_hours: Numeric offset from UTC (e.g., -8 for PST, -5 for EST)
-    
-    Returns:
-    - Set of integers representing UTC hours (0-23) when this person is available
-    
-    Example:
-    - PST person (offset=-8) with "Morning" (8am-12pm local)
-    - Local hours: {8, 9, 10, 11}
-    - UTC conversion: {(8-(-8))%24, (9-(-8))%24, ...} = {16, 17, 18, 19}
-    """
-    # Handle "No Preference" or unknown slots
-    if (not slot_label or 
-        slot_label == "No Preference" or 
-        slot_label not in TIME_SLOT_DEFINITIONS or 
-        TIME_SLOT_DEFINITIONS[slot_label] is None):
-        return set()  # Empty set means no specific preference
-    
-    start_local, end_local = TIME_SLOT_DEFINITIONS[slot_label]
-    utc_hour_set = set()
-    
-    # Convert each local hour to its UTC equivalent
-    for local_hour in range(start_local, end_local):
-        # Handle 24-hour wraparound and timezone conversion
-        actual_local_hour = local_hour % 24  # Handle cases like hour 32 -> 8
-        utc_hour = (actual_local_hour - timezone_offset_hours) % 24
-        utc_hour_set.add(utc_hour)
-    
-    return utc_hour_set
-
-def calculate_utc_availability_overlap_bonus(mentor_slot, mentor_offset, mentee_slot, mentee_offset):
-    """
-    Calculate scoring bonus based on actual UTC time overlap between mentor and mentee.
-    
-    BUSINESS LOGIC:
-    - More overlapping hours = higher compatibility score
-    - "No Preference" from either person = neutral (no bonus/penalty)
-    - Each overlapping hour contributes equally to the match quality
-    
-    SCORING:
-    - Each overlapping UTC hour = +8 points
-    - Maximum possible overlap varies by slot (Morning = 4 hrs max, Evening = 4 hrs max)
-    - Cross-timezone matches can still work if availability windows align
-    
-    Returns:
-    - Integer points to add to overall match score
-    """
-    # Handle "No Preference" cases neutrally
-    if mentor_slot == "No Preference" or mentee_slot == "No Preference":
-        return 0  # Neutral - don't penalize flexibility, but no match bonus
-    
-    # Convert both preferences to UTC hour sets
-    mentor_utc_hours = convert_local_timeslot_to_utc_hours(mentor_slot, mentor_offset)
-    mentee_utc_hours = convert_local_timeslot_to_utc_hours(mentee_slot, mentee_offset)
-    
-    # Calculate intersection (overlapping hours)
-    overlapping_hours = mentor_utc_hours & mentee_utc_hours
-    overlap_count = len(overlapping_hours)
-    
-    # Score: 8 points per overlapping hour
-    # This makes time compatibility meaningful in the overall scoring
-    points_per_hour = 8
-    total_bonus = overlap_count * points_per_hour
-    
-    return total_bonus
-
-# =
+# ============================================================================
 # SCORING SYSTEM CONFIGURATION
-# =
+# ============================================================================
 
 """
-SCORING WEIGHTS: Higher weights = more important for matching
+NEW SCORING WEIGHTS: Based on updated business requirements
 These weights determine how much each type of similarity contributes to the match score.
-They're based on business requirements and can be tuned based on matching outcomes.
+Higher weights = more important for matching.
 """
 ATTRIBUTE_WEIGHTS = {
-    "Roles": 8,                # Job roles are very important for relevant mentoring
-    "Topics": 7,               # Shared interests enable better conversations
-    "Industry": 6,             # Industry knowledge transfer is valuable
-    "Company Stage": 5,        # Stage-specific challenges and advice
-    "OffsetExact": 2,          # Small bonus for exact same time zone
-    "InPerson": 1,             # In-person meeting capability (nice to have)
-    "Sentiment": 3,            # Communication style match (down-weighted to avoid noise)
+    "Roles": 8,                # Each shared role = +80 points
+    "Topics": 7,               # Each shared topic = +70 points
+    "Industry": 6,             # Each shared industry = +60 points
+    "Company Stage": 5,        # Each shared stage = +50 points
+    "In-Person Meeting Location": 1,  # Each shared location = +10 points
 }
 
-BASE_SCORE = 0.0  # Start from 0; all scoring is additive rewards (no penalties for dissimilarity)
+BASE_SCORE = 0.0  # Start from 0; all scoring is additive rewards
 
 def calculate_set_similarity_bonus(mentor_set, mentee_set, points_per_match):
     """
@@ -430,12 +312,10 @@ def calculate_timezone_proximity_bonus(mentor_offset, mentee_offset):
     1. Hard constraint: Must be within ±2 hours (enforced elsewhere)
     2. Within that constraint: Closer = better for general scheduling flexibility
     
-    SCORING:
-    - Same time zone (0 difference): +10 base + +20 exact bonus = +30 total
-    - 1 hour apart: +5 base = +5 total  
-    - 2 hours apart: +0 base = +0 total
-    
-    NOTE: This is separate from time slot overlap, which handles specific availability windows.
+    NEW SCORING:
+    - Same time zone (0 difference): +30 points
+    - 1 hour apart: +25 points  
+    - 2 hours apart: +20 points
     """
     if pd.isna(mentor_offset) or pd.isna(mentee_offset):
         return 0.0
@@ -446,28 +326,28 @@ def calculate_timezone_proximity_bonus(mentor_offset, mentee_offset):
     if time_difference > 2:
         return -np.inf
     
-    # Base proximity bonus: closer time zones get more points
-    proximity_bonus = max(0, 2 - time_difference) * 5.0
-    
-    # Additional bonus for exact same time zone (no conversion needed for any meetings)
+    # NEW SCORING LOGIC
     if time_difference == 0:
-        proximity_bonus += 10.0 * ATTRIBUTE_WEIGHTS["OffsetExact"]
+        return 30.0    # Same timezone
+    elif time_difference == 1:
+        return 25.0    # 1 hour apart
+    elif time_difference == 2:
+        return 20.0    # 2 hours apart
     
-    return proximity_bonus
+    return 0.0
 
 def calculate_experience_bonus(mentor_yoe, mentee_yoe):
     """
     Calculate bonus points based on years of experience gap.
     
-    BUSINESS RULES:
+    NEW BUSINESS RULES:
     1. Mentor MUST have more experience than mentee (hard constraint)
     2. Different experience gaps have different values for mentoring:
     
-    EXPERIENCE GAP SCORING:
+    NEW EXPERIENCE GAP SCORING:
     - 2-3 years: +160 points (sweet spot - recent relevant experience)
     - 4-8 years: +100 points (good gap - substantial experience difference) 
     - 8+ years: +50 points (large gap - very senior mentor)
-    - 1-2 years: +10 points (minimal gap but still valid)
     - 0 or negative: INVALID (mentor must be more experienced)
     """
     if pd.isna(mentor_yoe) or pd.isna(mentee_yoe):
@@ -479,7 +359,7 @@ def calculate_experience_bonus(mentor_yoe, mentee_yoe):
     if experience_gap <= 0:
         return -np.inf
     
-    # Score based on optimal experience gaps for mentoring relationships
+    # NEW scoring based on optimal experience gaps for mentoring relationships
     if 2 <= experience_gap <= 3:
         return 160.0    # Optimal gap - recent enough to be relevant
     elif 4 <= experience_gap <= 8:
@@ -487,45 +367,65 @@ def calculate_experience_bonus(mentor_yoe, mentee_yoe):
     elif experience_gap > 8:
         return 50.0     # Large gap - very senior mentor
     else:
-        # Small gap (mentor > mentee but < 2 years) - valid but not ideal
-        return 10.0
+        # Gap < 2 years - not valid under new rules
+        return -np.inf
+
+def calculate_time_slot_bonus(mentor_slot, mentee_slot):
+    """
+    Calculate bonus/penalty for time slot preference matching.
+    
+    NEW BUSINESS RULES:
+    - If both specify and match: +60 points
+    - If both specify but differ: -5 points
+    - If either has "No Preference": no bonus/penalty (neutral)
+    """
+    # Handle "No Preference" cases neutrally
+    if mentor_slot == "No Preference" or mentee_slot == "No Preference":
+        return 0.0  # Neutral - no bonus or penalty
+    
+    # Both have specific preferences
+    if mentor_slot == mentee_slot:
+        return 60.0  # Match bonus
+    else:
+        return -5.0  # Mismatch penalty
 
 def calculate_sentiment_alignment_bonus(mentor_sentiment, mentee_sentiment):
     """
     Calculate bonus for sentiment/communication style similarity.
     
-    METHODOLOGY:
+    NEW METHODOLOGY:
     - Both sentiments are in [-1, 1] range from VADER
     - Alignment = 1 - |difference| gives similarity score in [0, 1]
-    - Scale by weight to get final bonus
+    - Scale to get up to +30 points maximum
     
     EXAMPLES:
     - Both 0.8 (very positive): alignment = 1.0 -> +30 points
-    - One 0.8, other 0.6: alignment = 0.8 -> +24 points  
+    - One 0.8, other 0.7: alignment = 0.9 -> +27 points  
     - One 0.5, other -0.5: alignment = 0.0 -> +0 points
-    
-    This is down-weighted (weight=3) to avoid noise from text analysis dominating.
     """
-    alignment_score = 1.0 - abs(mentor_sentiment - mentee_sentiment)
-    return alignment_score * 10.0 * ATTRIBUTE_WEIGHTS["Sentiment"]
+    max_difference = 2.0  # Range from -1 to +1 = 2.0 total range
+    actual_difference = abs(mentor_sentiment - mentee_sentiment)
+    alignment_score = 1.0 - (actual_difference / max_difference)
+    return alignment_score * 30.0
 
 def compute_overall_match_score(mentor_row, mentee_row):
     """
     Calculate the total compatibility score between a mentor and mentee.
     
-    SCORING PHILOSOPHY:
+    NEW SCORING PHILOSOPHY:
     - Start from 0 and add points for positive attributes
     - Similarity increases score (people with common ground work well together)
     - Hard constraints return -infinity (impossible matches)
     - All business rules and weights are applied here
-    - Enhanced: Time slot scoring based on actual UTC overlap hours
     
     Returns:
     - Positive number: viable match (higher = better)
     - -infinity: impossible match (fails hard constraints)
     """
     
-    # = HARD CONSTRAINTS (MUST PASS) =
+    # ========================================================================
+    # HARD CONSTRAINTS (MUST PASS)
+    # ========================================================================
     
     # Time zone constraint: must be within ±2 hours for practical scheduling
     mentor_tz = mentor_row["Offset"]
@@ -539,13 +439,15 @@ def compute_overall_match_score(mentor_row, mentee_row):
     
     # Experience constraint: mentor must be more experienced for mentoring value
     experience_bonus = calculate_experience_bonus(
-        mentor_row["Avg Year of YOE"], 
-        mentee_row["Avg Year of YOE"]
+        mentor_row["Years of Experience"], 
+        mentee_row["Years of Experience"]
     )
     if experience_bonus == -np.inf:
         return -np.inf
     
-    # = SCORE CALCULATION (ADD POINTS FOR COMPATIBILITY) =
+    # ========================================================================
+    # SCORE CALCULATION (ADD POINTS FOR COMPATIBILITY)
+    # ========================================================================
     
     total_score = BASE_SCORE
     
@@ -558,26 +460,26 @@ def compute_overall_match_score(mentor_row, mentee_row):
         return -np.inf
     total_score += timezone_bonus
     
-    # Add bonuses for shared attributes (similarity rewards)
+    # Add bonuses for shared attributes (NEW WEIGHTS)
     total_score += calculate_set_similarity_bonus(
         mentor_row["Roles"], mentee_row["Roles"], 
-        10.0 * ATTRIBUTE_WEIGHTS["Roles"]
+        10.0 * ATTRIBUTE_WEIGHTS["Roles"]  # Each shared role = +80 points
     )
     total_score += calculate_set_similarity_bonus(
         mentor_row["Topics"], mentee_row["Topics"], 
-        10.0 * ATTRIBUTE_WEIGHTS["Topics"]
+        10.0 * ATTRIBUTE_WEIGHTS["Topics"]  # Each shared topic = +70 points
     )
     total_score += calculate_set_similarity_bonus(
         mentor_row["Industry"], mentee_row["Industry"], 
-        10.0 * ATTRIBUTE_WEIGHTS["Industry"]
+        10.0 * ATTRIBUTE_WEIGHTS["Industry"]  # Each shared industry = +60 points
     )
     total_score += calculate_set_similarity_bonus(
         mentor_row["Company Stage"], mentee_row["Company Stage"], 
-        10.0 * ATTRIBUTE_WEIGHTS["Company Stage"]
+        10.0 * ATTRIBUTE_WEIGHTS["Company Stage"]  # Each shared stage = +50 points
     )
     total_score += calculate_set_similarity_bonus(
         mentor_row["In-Person Meeting Location"], mentee_row["In-Person Meeting Location"], 
-        10.0 * ATTRIBUTE_WEIGHTS["InPerson"]
+        10.0 * ATTRIBUTE_WEIGHTS["In-Person Meeting Location"]  # Each shared location = +10 points
     )
     
     # Add bonus for matching important attributes (when both are specific, not "No Preference")
@@ -591,15 +493,14 @@ def compute_overall_match_score(mentor_row, mentee_row):
             mentor_value == mentee_value):
             total_score += 10.0
     
-    # Add UTC time slot availability overlap bonus (ENHANCED FEATURE)
-    # This replaces the simple label matching with actual hour-based overlap calculation
-    availability_bonus = calculate_utc_availability_overlap_bonus(
-        mentor_row["Time Slot Preference"], mentor_row["Offset"],
-        mentee_row["Time Slot Preference"], mentee_row["Offset"]
+    # Add time slot matching bonus/penalty (NEW LOGIC)
+    time_slot_bonus = calculate_time_slot_bonus(
+        mentor_row["Time Slot Preference"],
+        mentee_row["Time Slot Preference"]
     )
-    total_score += availability_bonus
+    total_score += time_slot_bonus
     
-    # Add sentiment alignment bonus
+    # Add sentiment alignment bonus (NEW SCORING)
     total_score += calculate_sentiment_alignment_bonus(
         mentor_row["Sentiment"], 
         mentee_row["Sentiment"]
@@ -607,11 +508,12 @@ def compute_overall_match_score(mentor_row, mentee_row):
     
     return total_score
 
-# =
+# ============================================================================
 # PAIRWISE SCORE COMPUTATION
-# =
+# ============================================================================
 
 print("Computing compatibility scores for all mentor-mentee pairs...")
+
 mentor_indices = mentors.index.tolist()
 mentee_indices = mentees.index.tolist()
 pair_compatibility_scores = {}
@@ -632,9 +534,9 @@ for mentor_idx in mentor_indices:
 if not pair_compatibility_scores:
     raise ValueError("No valid matches found under current constraints. Check your data and business rules.")
 
-# =
+# ============================================================================
 # OPTIMIZATION SETUP (LINEAR PROGRAMMING)
-# =
+# ============================================================================
 
 print("Setting up optimization problem...")
 
@@ -667,9 +569,9 @@ for (mentor_idx, mentee_idx) in pair_compatibility_scores.keys():
     var_name = f"x_{mentor_idx}_{mentee_idx}"
     matching_variables[(mentor_idx, mentee_idx)] = solver.BoolVar(var_name)
 
-# =
+# ============================================================================
 # OPTIMIZATION CONSTRAINTS
-# =
+# ============================================================================
 
 print("Adding business constraints...")
 
@@ -699,9 +601,9 @@ for mentor_idx in mentor_indices:
     if potential_matches:  # Only add constraint if there are potential matches
         solver.Add(solver.Sum(potential_matches) <= 2)
 
-# =
+# ============================================================================
 # OPTIMIZATION OBJECTIVE
-# =
+# ============================================================================
 
 print("Setting optimization objective...")
 
@@ -714,9 +616,9 @@ for (mentor_idx, mentee_idx), compatibility_score in pair_compatibility_scores.i
 
 solver.Maximize(solver.Sum(objective_terms))
 
-# =
+# ============================================================================
 # SOLVE OPTIMIZATION PROBLEM
-# =
+# ============================================================================
 
 print("Solving optimization problem...")
 solution_status = solver.Solve()
@@ -726,9 +628,9 @@ if solution_status != pywraplp.Solver.OPTIMAL:
 
 print("Optimal solution found!")
 
-# =
+# ============================================================================
 # EXTRACT SOLUTION & PREPARE OUTPUT
-# =
+# ============================================================================
 
 print("Extracting matches and preparing output...")
 
@@ -738,9 +640,9 @@ for (mentor_idx, mentee_idx), decision_variable in matching_variables.items():
     if decision_variable.solution_value() > 0.5:  # Variable is set to 1 (matched)
         mentor_to_mentees_mapping[mentor_idx].append(mentee_idx)
 
-# =
+# ============================================================================
 # OUTPUT FORMATTING WITH COMPREHENSIVE DUPLICATE PREVENTION
-# =
+# ============================================================================
 
 """
 OUTPUT FORMAT:
@@ -760,13 +662,13 @@ CRITICAL DUPLICATE PREVENTION:
 # Define which columns to include in output (only matching criteria for clarity)
 output_columns = [
     "Offset",                      # Time zone for scheduling
-    "Avg Year of YOE",            # Experience level
+    "Years of Experience",         # Experience level - UPDATED COLUMN NAME
     "Roles",                       # Job roles for relevance
     "Topics",                      # Topics of interest
     "Industry",                    # Industry background
     "Company Stage",               # Company stage experience
     "In-Person Meeting Location",  # Meeting location preferences
-    "Time Slot Preference",        # Scheduling preferences (original label)
+    "Time Slot Preference",        # Scheduling preferences
     "Sentiment",                   # Communication style indicator
 ]
 
@@ -846,9 +748,9 @@ for mentor_idx in sorted(mentor_to_mentees_mapping.keys(), key=get_mentor_sort_k
                 
                 output_data_rows.append(mentee_output_row)
 
-# =
+# ============================================================================
 # FINAL SAFETY NET: NUCLEAR DUPLICATE REMOVAL
-# =
+# ============================================================================
 
 """
 FINAL DEDUPLICATION LAYER:
@@ -861,11 +763,10 @@ final_output_df = pd.DataFrame(output_data_rows)
 # NUCLEAR OPTION: Final deduplication by submission ID (keeps first occurrence)
 final_output_df = final_output_df.drop_duplicates(subset=['Submission ID'], keep='first')
 
-# =
+# ============================================================================
 # SAVE OUTPUT FILE
-# =
+# ============================================================================
 
 print("Saving results...")
 final_output_df.to_csv(OUTPUT_CSV, index=False)
-
 print(f"✅ Matching complete! Results saved to: {OUTPUT_CSV}")
